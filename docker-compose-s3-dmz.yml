@@ -1,0 +1,331 @@
+version: '3.8'
+
+# ============================================================================
+# LOGISTOCK S3 — Architecture SÉCURISÉE avec DMZ, Pare-feu, IDS
+# ============================================================================
+# Évolution majeure S2 → S3 : Segmentation réseau complète
+#
+# AMÉLIORATIONS PAR RAPPORT À S2 :
+# ✅ 3 réseaux isolés : DMZ / Internal / Admin
+# ✅ Pare-feu avec iptables (contrôle des flux)
+# ✅ IDS Snort pour détection d'intrusion
+# ✅ Bastion host pour accès admin
+# ✅ NAS RH isolé dans le réseau interne
+# ✅ Serveur web dans la DMZ (exposition contrôlée)
+# ✅ Logs centralisés
+#
+# ARCHITECTURE :
+#  Internet → [DMZ: web, proxy] → [Firewall] → [Internal: db, nas]
+#                                             ↓
+#                                     [Admin: bastion]
+# ============================================================================
+
+networks:
+  # Zone exposée à Internet
+  dmz:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.1.0.0/24
+
+  # Zone interne sécurisée
+  internal:
+    driver: bridge
+    internal: true  # ✅ Pas d'accès direct à Internet
+    ipam:
+      config:
+        - subnet: 10.2.0.0/24
+
+  # Zone admin (accès privilégié)
+  admin:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.3.0.0/24
+
+services:
+  # ==========================================================================
+  # DMZ — Reverse Proxy NGINX (point d'entrée HTTPS)
+  # ==========================================================================
+  proxy:
+    image: nginx:alpine
+    container_name: logistock_proxy
+    hostname: logistock-proxy
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.10
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./s2-nginx-proxy.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - web
+    restart: unless-stopped
+    labels:
+      zone: "dmz"
+      role: "proxy"
+
+  # ==========================================================================
+  # DMZ — Serveur Web Application
+  # ==========================================================================
+  web:
+    image: php:7.4-apache
+    container_name: logistock_web
+    hostname: logistock-web
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.20
+    environment:
+      - MYSQL_HOST=10.2.0.30  # ✅ Accès via firewall uniquement
+      - MYSQL_PORT=3306
+      - MYSQL_DATABASE=logistock
+      - MYSQL_USER=appuser
+      - MYSQL_PASSWORD=SuperSecurePassword2024!
+    volumes:
+      - ./app:/var/www/html
+    restart: unless-stopped
+    labels:
+      zone: "dmz"
+      role: "webapp"
+
+  # ==========================================================================
+  # FIREWALL — Contrôle des flux DMZ ↔ Internal
+  # ==========================================================================
+  firewall:
+    image: alpine:latest
+    container_name: logistock_firewall
+    hostname: logistock-firewall
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.254
+      internal:
+        ipv4_address: 10.2.0.254
+      admin:
+        ipv4_address: 10.3.0.254
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./s3-firewall-rules.sh:/firewall-rules.sh:ro
+      - firewall_logs:/var/log/firewall
+    command: |
+      sh -c "
+        apk add --no-cache iptables ip6tables tcpdump &&
+        
+        # ✅ Activer le routage IP
+        echo 1 > /proc/sys/net/ipv4/ip_forward &&
+        
+        # ✅ Politique par défaut : BLOQUER TOUT
+        iptables -P INPUT DROP &&
+        iptables -P FORWARD DROP &&
+        iptables -P OUTPUT ACCEPT &&
+        
+        # ✅ Autoriser loopback
+        iptables -A INPUT -i lo -j ACCEPT &&
+        
+        # ✅ Autoriser connexions établies
+        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT &&
+        
+        # ✅ RÈGLE 1 : web → db (port 3306 MySQL)
+        iptables -A FORWARD -s 10.1.0.20 -d 10.2.0.30 -p tcp --dport 3306 -j ACCEPT &&
+        
+        # ✅ RÈGLE 2 : BLOQUER web → nas (isolation des données RH)
+        iptables -A FORWARD -s 10.1.0.20 -d 10.2.0.40 -j DROP &&
+        
+        # ✅ RÈGLE 3 : bastion → internal (accès admin)
+        iptables -A FORWARD -s 10.3.0.10 -d 10.2.0.0/24 -j ACCEPT &&
+        
+        # ✅ RÈGLE 4 : IDS peut voir tout le trafic DMZ (mode miroir)
+        iptables -A FORWARD -d 10.1.0.50 -j ACCEPT &&
+        
+        # ✅ Logging des paquets bloqués
+        iptables -A FORWARD -j LOG --log-prefix '[FIREWALL BLOCKED] ' --log-level 4 &&
+        
+        echo '✅ Firewall initialized' &&
+        iptables -L -n -v &&
+        
+        # ✅ Capturer le trafic pour analyse IDS
+        tcpdump -i any -w /var/log/firewall/traffic.pcap &
+        
+        sleep infinity
+      "
+    restart: unless-stopped
+    labels:
+      zone: "all"
+      role: "firewall"
+
+  # ==========================================================================
+  # INTERNAL — Base de données MySQL
+  # ==========================================================================
+  db:
+    image: mysql:5.7
+    container_name: logistock_db
+    hostname: logistock-db
+    networks:
+      internal:
+        ipv4_address: 10.2.0.30
+    environment:
+      - MYSQL_ROOT_PASSWORD=SuperSecurePassword2024!
+      - MYSQL_DATABASE=logistock
+      - MYSQL_USER=appuser
+      - MYSQL_PASSWORD=SuperSecurePassword2024!
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./s2-init-hashed.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    labels:
+      zone: "internal"
+      role: "database"
+
+  # ==========================================================================
+  # INTERNAL — NAS Fichiers RH (ISOLÉ de la DMZ)
+  # ==========================================================================
+  nas:
+    image: alpine:latest
+    container_name: logistock_nas
+    hostname: logistock-nas
+    networks:
+      internal:
+        ipv4_address: 10.2.0.40
+    volumes:
+      - nas_data:/data
+      - ./fiches_paie_sample:/data/rh:ro
+    command: |
+      sh -c "
+        echo 'NAS LogiStock - Données RH PROTÉGÉES (S3)' > /data/README.txt &&
+        chmod 700 /data &&
+        echo '✅ NAS isolé du réseau DMZ' &&
+        sleep infinity
+      "
+    restart: unless-stopped
+    labels:
+      zone: "internal"
+      role: "storage"
+      confidentiality: "high"
+
+  # ==========================================================================
+  # DMZ — IDS Snort (Intrusion Detection System)
+  # ==========================================================================
+  ids:
+    image: ciscotalos/snort3:latest
+    container_name: logistock_ids
+    hostname: logistock-ids
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.50
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./s3-snort.conf:/etc/snort/snort.conf:ro
+      - ./s3-snort-rules.rules:/etc/snort/rules/local.rules:ro
+      - ids_logs:/var/log/snort
+    command: |
+      sh -c "
+        snort -c /etc/snort/snort.conf -i eth0 -A full -l /var/log/snort
+      "
+    restart: unless-stopped
+    labels:
+      zone: "dmz"
+      role: "ids"
+
+  # ==========================================================================
+  # ADMIN — Bastion Host (Jump Server pour accès admin)
+  # ==========================================================================
+  bastion:
+    image: alpine:latest
+    container_name: logistock_bastion
+    hostname: logistock-bastion
+    networks:
+      admin:
+        ipv4_address: 10.3.0.10
+      internal:
+        ipv4_address: 10.2.0.10  # ✅ Pont vers internal
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - bastion_logs:/var/log/bastion
+    command: |
+      sh -c "
+        apk add --no-cache openssh-server mysql-client &&
+        ssh-keygen -A &&
+        echo 'root:BastionSecure2024!' | chpasswd &&
+        
+        # ✅ Config SSH sécurisée
+        sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config &&
+        sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config &&
+        
+        /usr/sbin/sshd -D -e
+      "
+    ports:
+      - "2222:22"  # SSH sur port 2222 (non standard)
+    restart: unless-stopped
+    labels:
+      zone: "admin"
+      role: "bastion"
+
+  # ==========================================================================
+  # INTERNAL — SIEM Logs centralisés (Grafana Loki)
+  # ==========================================================================
+  siem:
+    image: grafana/loki:latest
+    container_name: logistock_siem
+    hostname: logistock-siem
+    networks:
+      internal:
+        ipv4_address: 10.2.0.50
+    ports:
+      - "3100:3100"
+    volumes:
+      - siem_data:/loki
+      - ./s3-loki-config.yml:/etc/loki/local-config.yaml:ro
+    restart: unless-stopped
+    labels:
+      zone: "internal"
+      role: "siem"
+
+volumes:
+  db_data:
+  nas_data:
+  firewall_logs:
+  ids_logs:
+  bastion_logs:
+  siem_data:
+
+# ============================================================================
+# INSTRUCTIONS DE DÉPLOIEMENT (S3)
+# ============================================================================
+# 1. Déployer la stack :
+#    docker-compose -f docker-compose-s3-dmz.yml up -d
+#
+# 2. Vérifier les réseaux :
+#    docker network ls
+#    docker network inspect logistock_dmz
+#    docker network inspect logistock_internal
+#
+# 3. Tester l'isolation DMZ/Internal :
+#    docker exec logistock_web ping 10.2.0.30  # → Devrait marcher (via firewall)
+#    docker exec logistock_web ping 10.2.0.40  # → Devrait ÉCHOUER (NAS bloqué)
+#
+# 4. Consulter les règles de pare-feu :
+#    docker exec logistock_firewall iptables -L -n -v
+#
+# 5. Consulter les logs IDS :
+#    docker exec logistock_ids tail -f /var/log/snort/alert
+#
+# 6. Se connecter au bastion :
+#    ssh -p 2222 root@localhost
+#    # Mot de passe : BastionSecure2024!
+#    # Depuis le bastion, accéder à la BDD :
+#    mysql -h 10.2.0.30 -u root -pSuperSecurePassword2024! logistock
+#
+# 7. Simuler une attaque pour tester l'IDS :
+#    nmap -sS -p 1-1000 localhost
+#    # L'IDS devrait logger les scans de ports
+#
+# 8. Visualiser l'architecture :
+#    docker ps --format "table {{.Names}}\t{{.Networks}}\t{{.Ports}}"
+# ============================================================================

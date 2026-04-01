@@ -1,0 +1,149 @@
+version: '3.8'
+
+# ============================================================================
+# LOGISTOCK S2 — Infrastructure avec CHIFFREMENT & HACHAGE
+# ============================================================================
+# Évolution de S1 → S2 : Ajout des protections cryptographiques
+#
+# AMÉLIORATIONS PAR RAPPORT À S1 :
+# ✅ HTTPS avec certificat TLS (au lieu de HTTP)
+# ✅ Mots de passe hashés en SHA-256 (au lieu de clair)
+# ✅ Mot de passe root MySQL renforcé
+# ✅ Port MySQL non exposé directement (uniquement via réseau interne)
+# ✅ Reverse proxy pour terminer le TLS
+#
+# FAILLES RESTANTES (à corriger en S3) :
+# ⚠️ Réseau toujours plat (pas de DMZ)
+# ⚠️ Pas d'IDS/IPS
+# ⚠️ Pas de segmentation réseau
+# ============================================================================
+
+networks:
+  app_network:
+    driver: bridge
+
+services:
+  # ==========================================================================
+  # Reverse Proxy NGINX — Terminaison TLS
+  # ==========================================================================
+  proxy:
+    image: nginx:alpine
+    container_name: logistock_proxy
+    hostname: logistock-proxy
+    networks:
+      - app_network
+    ports:
+      - "443:443"  # ✅ HTTPS
+      - "80:80"    # Redirection HTTP → HTTPS
+    volumes:
+      - ./s2-nginx-proxy.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./html:/usr/share/nginx/html:ro
+    depends_on:
+      - web
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Serveur Web — Application LogiStock
+  # ==========================================================================
+  web:
+    image: php:7.4-apache
+    container_name: logistock_web
+    hostname: logistock-web
+    networks:
+      - app_network
+    environment:
+      - MYSQL_HOST=db
+      - MYSQL_PORT=3306
+      - MYSQL_DATABASE=logistock
+      - MYSQL_USER=appuser
+      - MYSQL_PASSWORD=SuperSecurePassword2024!  # ✅ Mot de passe FORT
+    volumes:
+      - ./app:/var/www/html
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Base de données MySQL — Mots de passe HASHÉS
+  # ==========================================================================
+  db:
+    image: mysql:5.7
+    container_name: logistock_db
+    hostname: logistock-db
+    networks:
+      - app_network
+    # ✅ Port 3306 NON exposé vers l'extérieur (uniquement app_network)
+    environment:
+      - MYSQL_ROOT_PASSWORD=SuperSecurePassword2024!  # ✅ MDP FORT
+      - MYSQL_DATABASE=logistock
+      - MYSQL_USER=appuser
+      - MYSQL_PASSWORD=SuperSecurePassword2024!
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./s2-init-hashed.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+
+  # ==========================================================================
+  # NAS Fichiers RH — Toujours sur le même réseau (à isoler en S3)
+  # ==========================================================================
+  nas:
+    image: alpine:latest
+    container_name: logistock_nas
+    hostname: logistock-nas
+    networks:
+      - app_network  # ⚠️ Pas encore isolé (S3)
+    volumes:
+      - nas_data:/data
+      - ./fiches_paie_sample:/data/rh:ro  # Read-only
+    command: |
+      sh -c "
+        echo 'NAS LogiStock - Données RH (Sécurisé S2)' > /data/README.txt &&
+        chmod 700 /data &&
+        sleep infinity
+      "
+    restart: unless-stopped
+
+volumes:
+  db_data:
+    driver: local
+  nas_data:
+    driver: local
+
+# ============================================================================
+# INSTRUCTIONS DE DÉPLOIEMENT (S2)
+# ============================================================================
+# PRÉREQUIS : Générer les certificats TLS
+#
+# 1. Créer le dossier certs :
+#    mkdir -p certs
+#
+# 2. Générer un certificat auto-signé :
+#    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+#      -keyout certs/logistock.key \
+#      -out certs/logistock.crt \
+#      -subj "/C=FR/ST=IDF/L=Paris/O=LogiStock/CN=logistock.local"
+#
+# 3. Créer le fichier de config NGINX (voir s2-nginx-proxy.conf)
+#
+# 4. Déployer la stack :
+#    docker-compose -f docker-compose-s2-crypto.yml up -d
+#
+# 5. Tester HTTPS :
+#    curl -k https://localhost
+#    # -k pour ignorer le certificat auto-signé
+#
+# 6. Vérifier les hashs en BDD :
+#    docker exec -it logistock_db mysql -u root -pSuperSecurePassword2024! logistock
+#    SELECT username, password_hash FROM users;
+#    # Les mots de passe sont maintenant des hashs SHA-256 (64 caractères)
+#
+# 7. Comparer avec S1 :
+#    docker exec -it logistock_db mysql -u root -pSuperSecurePassword2024! logistock
+#    SELECT * FROM users;
+#    # Question : Pourquoi un attaquant ne peut plus lire les mots de passe ?
+#
+# 8. Tester le chiffrement TLS :
+#    openssl s_client -connect localhost:443 -showcerts
+#    # Affiche les détails du certificat et la négociation TLS
+# ============================================================================

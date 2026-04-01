@@ -1,0 +1,116 @@
+version: '3.8'
+
+# ============================================================================
+# LOGISTOCK S1 — Infrastructure VULNÉRABLE (avant incidents)
+# ============================================================================
+# Ce compose déploie l'architecture de LogiStock AVANT les mesures de sécurité.
+# Utilisé en S1 pour comprendre les failles initiales.
+#
+# FAILLES VOLONTAIRES :
+# - Réseau plat (tous les services sur le même réseau)
+# - Port MySQL exposé sur Internet (3306)
+# - Mots de passe faibles
+# - Passwords stockés en clair dans la BDD
+# - Pas de chiffrement TLS
+# ============================================================================
+
+networks:
+  flat_network:
+    driver: bridge
+
+services:
+  # ==========================================================================
+  # Serveur Web — Application LogiStock (vulnérable)
+  # ==========================================================================
+  web:
+    image: vulnerables/web-dvwa:latest
+    container_name: logistock_web
+    hostname: logistock-web
+    networks:
+      - flat_network
+    ports:
+      - "80:80"  # ⚠️ HTTP non chiffré
+    environment:
+      - MYSQL_HOST=db
+      - MYSQL_PORT=3306
+      - MYSQL_DATABASE=logistock
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=LogiStock2023  # ⚠️ Mot de passe FAIBLE
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Base de données MySQL — Données LogiStock
+  # ==========================================================================
+  db:
+    image: mysql:5.7
+    container_name: logistock_db
+    hostname: logistock-db
+    networks:
+      - flat_network
+    ports:
+      - "3306:3306"  # ⚠️ PORT EXPOSÉ SUR INTERNET (faille critique)
+    environment:
+      - MYSQL_ROOT_PASSWORD=LogiStock2023  # ⚠️ Mot de passe FAIBLE
+      - MYSQL_DATABASE=logistock
+      - MYSQL_USER=appuser
+      - MYSQL_PASSWORD=LogiStock2023
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./s1-init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+
+  # ==========================================================================
+  # NAS Fichiers RH — Données sensibles (fiches de paie)
+  # ==========================================================================
+  nas:
+    image: alpine:latest
+    container_name: logistock_nas
+    hostname: logistock-nas
+    networks:
+      - flat_network  # ⚠️ Sur le même réseau que le web (pas d'isolation)
+    volumes:
+      - nas_data:/data
+      - ./fiches_paie_sample:/data/rh  # Fichiers RH sensibles
+    command: |
+      sh -c "
+        echo 'NAS LogiStock - Données RH' > /data/README.txt &&
+        echo 'Mot de passe NAS : LogiStock2023' >> /data/README.txt &&
+        chmod 777 /data &&
+        sleep infinity
+      "
+    restart: unless-stopped
+
+volumes:
+  db_data:
+    driver: local
+  nas_data:
+    driver: local
+
+# ============================================================================
+# INSTRUCTIONS DE DÉPLOIEMENT (S1)
+# ============================================================================
+# 1. Créer le dossier fiches_paie_sample :
+#    mkdir -p fiches_paie_sample
+#    echo "Alice Dupont - Salaire 3500€" > fiches_paie_sample/alice.txt
+#
+# 2. Déployer la stack :
+#    docker-compose -f docker-compose-s1-vulnerable.yml up -d
+#
+# 3. Vérifier les conteneurs :
+#    docker ps
+#
+# 4. Se connecter à la BDD (tester la faille) :
+#    docker exec -it logistock_db mysql -u root -pLogiStock2023 logistock
+#    SELECT * FROM users;  -- Les mots de passe sont EN CLAIR
+#
+# 5. Tester l'exposition du port MySQL :
+#    nmap -p 3306 localhost
+#
+# 6. Accéder au NAS depuis le web (faille isolation) :
+#    docker exec logistock_web ping logistock_nas
+#    # ✓ Devrait marcher → PROBLÈME d'isolation
+#
+# 7. Identifier les 5 failles principales pour le TP S1
+# ============================================================================
