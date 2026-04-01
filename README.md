@@ -1,7 +1,7 @@
 # 🏗️ GUIDE FIL ROUGE — Infrastructure LogiStock
 
-**SECE854 — Sécurisation de l'Infrastructure**  
-**EPSI 2025-2026**
+**Sécurisation de l'Infrastructure**  
+
 
 ---
 
