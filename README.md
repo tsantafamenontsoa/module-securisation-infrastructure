@@ -20,7 +20,7 @@
 
 ---
 
-## 🎯 Introduction
+## Introduction
 
 Ce guide vous accompagne tout au long du semestre pour **construire et sécuriser** l'infrastructure de l'entreprise LogiStock.
 
